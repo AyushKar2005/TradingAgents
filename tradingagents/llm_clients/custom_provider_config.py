@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ModelOption = Tuple[str, str]
+
+logger = logging.getLogger(__name__)
 
 CUSTOM_MODELS_FILE = Path.home() / ".tradingagents" / "custom_models.json"
 _PROVIDER_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -54,6 +58,10 @@ def _normalize_models(models: Any) -> Optional[Dict[str, List[ModelOption]]]:
 
 def _normalize_provider(raw: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
+        logger.warning(
+            "Ignoring custom provider in %s: entry is not a JSON object.",
+            CUSTOM_MODELS_FILE,
+        )
         return None
 
     display_name = raw.get("display_name") or raw.get("name")
@@ -63,17 +71,42 @@ def _normalize_provider(raw: Any) -> Optional[Dict[str, Any]]:
     api_type = raw.get("api_type", "openai_compatible")
 
     if not display_name or not provider_key or not base_url:
+        logger.warning(
+            "Ignoring custom provider %r in %s: 'display_name', "
+            "'provider_key', and 'base_url' are all required.",
+            provider_key or display_name,
+            CUSTOM_MODELS_FILE,
+        )
         return None
 
     provider_key = str(provider_key).strip().lower()
     if not _PROVIDER_KEY_RE.match(provider_key):
+        logger.warning(
+            "Ignoring custom provider %r in %s: provider_key must match %s.",
+            provider_key,
+            CUSTOM_MODELS_FILE,
+            _PROVIDER_KEY_RE.pattern,
+        )
         return None
 
     if api_type != "openai_compatible":
+        logger.warning(
+            "Ignoring custom provider %r in %s: unsupported api_type %r "
+            "(only 'openai_compatible' is supported).",
+            provider_key,
+            CUSTOM_MODELS_FILE,
+            api_type,
+        )
         return None
 
     models = _normalize_models(raw.get("models"))
     if not models:
+        logger.warning(
+            "Ignoring custom provider %r in %s: 'models' must be an object "
+            "with 'quick' and/or 'deep' model lists.",
+            provider_key,
+            CUSTOM_MODELS_FILE,
+        )
         return None
 
     return {
@@ -86,18 +119,36 @@ def _normalize_provider(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def load_custom_providers() -> List[Dict[str, Any]]:
-    if not CUSTOM_MODELS_FILE.exists():
-        return []
+@functools.lru_cache(maxsize=4)
+def _load_custom_providers_cached(
+    path: str, mtime: float
+) -> Tuple[Dict[str, Any], ...]:
+    """Parse and normalize the config file.
 
+    Memoized on ``(path, mtime)`` so the file is re-read and re-parsed only
+    when it changes on disk. ``is_custom_openai_compatible_provider`` runs on
+    the client-factory hot path, so the previous read-and-parse-on-every-call
+    behavior was wasteful. Returns a tuple (immutable, hashable cache value);
+    the public wrapper converts it back to a list of dicts.
+    """
     try:
-        data = json.loads(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(
+            "Could not parse custom provider config %s: %s. "
+            "No custom providers will be available.",
+            path,
+            exc,
+        )
+        return ()
 
-    raw_providers = data.get("providers", [])
+    raw_providers = data.get("providers", []) if isinstance(data, dict) else None
     if not isinstance(raw_providers, list):
-        return []
+        logger.warning(
+            "Custom provider config %s has no 'providers' list; ignoring.",
+            path,
+        )
+        return ()
 
     providers: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -109,12 +160,42 @@ def load_custom_providers() -> List[Dict[str, Any]]:
 
         key = provider["provider_key"]
         if key in seen:
+            logger.warning(
+                "Ignoring duplicate custom provider %r in %s (first wins).",
+                key,
+                path,
+            )
             continue
 
         seen.add(key)
         providers.append(provider)
 
-    return providers
+    return tuple(providers)
+
+
+def load_custom_providers() -> List[Dict[str, Any]]:
+    if not CUSTOM_MODELS_FILE.exists():
+        return []
+
+    try:
+        mtime = CUSTOM_MODELS_FILE.stat().st_mtime
+    except OSError:
+        # File vanished between exists() and stat(); treat as absent.
+        return []
+
+    # Return copies so callers cannot mutate the cached entries.
+    return [dict(p) for p in _load_custom_providers_cached(str(CUSTOM_MODELS_FILE), mtime)]
+
+
+def clear_cache() -> None:
+    """Drop the memoized config.
+
+    The loader is keyed on the file's mtime, so a normal on-disk edit is
+    picked up automatically. This helper exists for the edge case of a
+    same-second rewrite (mtime unchanged) — notably in tests — and for
+    callers that want to force a re-read.
+    """
+    _load_custom_providers_cached.cache_clear()
 
 
 def get_custom_provider_choices() -> List[Tuple[str, str, str]]:

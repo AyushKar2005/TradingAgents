@@ -212,6 +212,12 @@ def get_known_models() -> Dict[str, List[str]]:
     }
 
     for provider, mode_options in get_all_custom_model_options().items():
+        # Never let a custom provider shadow a built-in one. A custom entry
+        # keyed e.g. "openai" must not replace the curated OpenAI model list
+        # that validators.warn_if_unknown consumes (mirrors the
+        # existing_provider_keys guard in cli.utils._llm_provider_table).
+        if provider in MODEL_OPTIONS:
+            continue
         known_models[provider] = sorted(
             {
                 value
