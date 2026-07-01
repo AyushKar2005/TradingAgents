@@ -681,16 +681,43 @@ def get_analysis_date():
             )
 
 
-def save_report_to_disk(final_state, ticker: str, save_path: Path):
+def resolve_save_target(save_path_str: str):
+    """Resolve a user-supplied save path into the right type for ``save_report_to_disk``.
+
+    Cloud URIs (e.g. ``s3://bucket/reports``) are returned as plain strings.
+    Wrapping them in :class:`~pathlib.Path` collapses the scheme's double slash
+    (``s3://bucket`` -> ``s3:/bucket``), which makes ``fsspec`` silently fall
+    back to a local directory and write the report to the wrong place. Only
+    genuinely local paths (no ``scheme://``) are converted to ``Path``.
+    """
+    if "://" in save_path_str:
+        return save_path_str
+    return Path(save_path_str)
+
+
+def save_report_to_disk(final_state, ticker: str, save_path):
     """Save complete analysis report to disk or cloud storage with organized subfolders.
-    
+
     Supports any fsspec-compatible path, including:
       - Local paths: /home/user/reports or C:\\reports
       - Amazon S3:   s3://my-bucket/reports
       - GCS:         gcs://my-bucket/reports
       - Azure:       az://my-container/reports
+
+    ``save_path`` may be a ``str`` URI (e.g. ``s3://bucket/reports``) or a
+    ``pathlib.Path`` for local destinations. Cloud URIs must be passed as plain
+    strings: wrapping them in ``Path`` collapses the ``scheme://`` double slash
+    (e.g. ``s3://bucket`` -> ``s3:/bucket``), which silently reroutes the write
+    to a bogus local directory.
     """
-    import fsspec
+    try:
+        import fsspec
+    except ImportError as exc:  # pragma: no cover - exercised via dependency install
+        raise ImportError(
+            "Saving reports requires the 'fsspec' package. Install it with "
+            "'pip install fsspec' (and a backend such as 's3fs', 'gcsfs' or "
+            "'adlfs' for cloud destinations)."
+        ) from exc
 
     base = str(save_path).rstrip("/")
 
@@ -707,7 +734,7 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         analyst_parts.append(("Market Analyst", final_state["market_report"]))
     if final_state.get("sentiment_report"):
         _write(f"{base}/1_analysts/sentiment.md", final_state["sentiment_report"])
-        analyst_parts.append(("Social Analyst", final_state["sentiment_report"]))
+        analyst_parts.append(("Sentiment Analyst", final_state["sentiment_report"]))
     if final_state.get("news_report"):
         _write(f"{base}/1_analysts/news.md", final_state["news_report"])
         analyst_parts.append(("News Analyst", final_state["news_report"]))
@@ -1245,13 +1272,13 @@ def run_analysis(checkpoint: bool = False):
             "Save path (press Enter for default)",
             default=str(default_path)
         ).strip()
-        save_path = Path(save_path_str)
+        save_path = resolve_save_target(save_path_str)
         try:
             report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path}")
             console.print(f"  [dim]Complete report:[/dim] {report_file}")
         except Exception as e:
-            console.print(f"[red]Error saving report: {e}[/red]")
+            console.print(f"[red]Error saving report to {save_path}: {e}[/red]")
 
     # Prompt to display full report
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
