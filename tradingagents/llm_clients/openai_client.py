@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
+from .custom_provider_config import is_custom_openai_compatible_provider
 from .validators import validate_model
 
 
@@ -202,6 +203,31 @@ class OpenAIClient(BaseLLMClient):
         super().__init__(model, base_url, **kwargs)
         self.provider = provider.lower()
 
+    def _resolve_api_key(self, llm_kwargs: dict) -> None:
+        """Resolve and inject the provider's API key into ``llm_kwargs``.
+
+        ``get_api_key_env`` consults both the built-in provider map and any
+        user-defined custom provider config, so this works for built-in
+        providers (xai/deepseek/...) AND for custom OpenAI-compatible
+        providers declared in ``~/.tradingagents/custom_models.json`` with an
+        ``api_key_env``. When a provider has no configured env var (e.g.
+        Ollama, or a custom keyless gateway), fall back to the placeholder
+        ``"ollama"`` key the OpenAI SDK accepts for unauthenticated endpoints.
+        """
+        api_key_env = get_api_key_env(self.provider)
+        if api_key_env:
+            api_key = os.environ.get(api_key_env)
+            if api_key:
+                llm_kwargs["api_key"] = api_key
+            else:
+                raise ValueError(
+                    f"API key for provider '{self.provider}' is not set. "
+                    f"Please set the {api_key_env} environment variable "
+                    f"(e.g. add {api_key_env}=your_key to your .env file)."
+                )
+        else:
+            llm_kwargs["api_key"] = "ollama"
+
     def get_llm(self) -> Any:
         """Return configured ChatOpenAI instance."""
         self.warn_if_unknown_model()
@@ -212,21 +238,19 @@ class OpenAIClient(BaseLLMClient):
         # provider default so users can route through their own gateway.
         if self.provider in _PROVIDER_BASE_URL:
             llm_kwargs["base_url"] = self.base_url or _resolve_provider_base_url(self.provider)
-            api_key_env = get_api_key_env(self.provider)
-            if api_key_env:
-                api_key = os.environ.get(api_key_env)
-                if api_key:
-                    llm_kwargs["api_key"] = api_key
-                else:
-                    raise ValueError(
-                        f"API key for provider '{self.provider}' is not set. "
-                        f"Please set the {api_key_env} environment variable "
-                        f"(e.g. add {api_key_env}=your_key to your .env file)."
-                    )
-            else:
-                llm_kwargs["api_key"] = "ollama"
+            self._resolve_api_key(llm_kwargs)
         elif self.base_url:
             llm_kwargs["base_url"] = self.base_url
+            # Custom OpenAI-compatible providers (declared in
+            # custom_models.json) reach here: they carry a base_url but are
+            # not in the built-in _PROVIDER_BASE_URL map. Resolve their
+            # configured api_key_env too, otherwise auth would silently fall
+            # back to OPENAI_API_KEY and bill the wrong account. Built-in
+            # providers that land here (e.g. native openai with an explicit
+            # backend_url) keep relying on the SDK's implicit env pickup, so
+            # their existing behavior is unchanged.
+            if is_custom_openai_compatible_provider(self.provider):
+                self._resolve_api_key(llm_kwargs)
 
         # Forward user-provided kwargs
         for key in _PASSTHROUGH_KWARGS:
